@@ -5,8 +5,6 @@ import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
-
 import triton
 import triton.language as tl
 
@@ -427,9 +425,6 @@ def grouped_topk(hidden_states: torch.Tensor,
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     return topk_weights, topk_ids
 
-def glu(x):
-    x = torch.chunk(x, 2, dim=-1)
-    return F.silu(x[0]) * x[1]
 
 def fused_experts(hidden_states: torch.Tensor,
                   w1: torch.Tensor,
@@ -442,8 +437,7 @@ def fused_experts(hidden_states: torch.Tensor,
                   w1_scale: Optional[torch.Tensor] = None,
                   w2_scale: Optional[torch.Tensor] = None,
                   a1_scale: Optional[torch.Tensor] = None,
-                  a2_scale: Optional[torch.Tensor] = None,
-                  model_type: str = None):
+                  a2_scale: Optional[torch.Tensor] = None):
     # Check constraints.
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
@@ -532,10 +526,7 @@ def fused_experts(hidden_states: torch.Tensor,
                                 compute_type=compute_type,
                                 use_fp8=use_fp8)
 
-        if model_type != 'yuan':
-            ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
-        else:
-            intermediate_cache2 = glu(intermediate_cache1.view(-1, N))
+        ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
 
         invoke_fused_moe_kernel(intermediate_cache2,
                                 w2,
@@ -630,5 +621,4 @@ def fused_moe(
                          w1_scale=w1_scale,
                          w2_scale=w2_scale,
                          a1_scale=a1_scale,
-                         a2_scale=a2_scale,
-                         )
+                         a2_scale=a2_scale)

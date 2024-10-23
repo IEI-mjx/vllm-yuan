@@ -45,7 +45,6 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.config import LoRAConfig, CacheConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from transformers.activations import ACT2FN
-#from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.attention import Attention, AttentionMetadata
 #from apex.normalization import MixedFusedRMSNorm as RMSNorm
@@ -72,12 +71,12 @@ from vllm.logger import init_logger
 from vllm.utils import is_hip
 
 from vllm.engine.llm_engine import LLMEngine
+from vllm.engine.async_llm_engine import AsyncLLMEngine, _AsyncLLMEngine # for api_server
+from vllm.outputs import EmbeddingRequestOutput, RequestOutput # for api_server
 from vllm.sequence import SequenceData
 from vllm.distributed.communication_op import broadcast_tensor_dict
 from vllm.distributed.parallel_state import get_tensor_model_parallel_group
-from vllm.engine.async_llm_engine import AsyncLLMEngine, _AsyncLLMEngine # for api_server
-from vllm.outputs import EmbeddingRequestOutput, RequestOutput # for api_server
-
+import grouped_gemm as gg
 # LFCache = Tuple[torch.Tensor, torch.Tensor]
 ### add lf1_caches and lf2_caches in SequenceData for Yuan model
 setattr(SequenceData, "lf1_caches", [])
@@ -87,6 +86,11 @@ global_seq_list = []
 class YuanLLMEngine(LLMEngine):
     
     def step(self):
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "Pipeline parallelism is only supported through AsyncLLMEngine "
+                "as performance will be severely degraded otherwise.")
+
         seq_group_metadata_list, scheduler_outputs = self.scheduler[0].schedule()
         global global_seq_list
         # each step needs to be cleared
@@ -112,9 +116,25 @@ class YuanLLMEngine(LLMEngine):
                 execute_model_req=execute_model_req)
         else:
             output = []
-        return self._process_model_outputs(output, scheduler_outputs.scheduled_seq_groups, scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
+        request_outputs = self._process_model_outputs(
+            output, scheduler_outputs.scheduled_seq_groups,
+            scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
 
-# api_server use
+        # Log stats.
+        self.do_log_stats(scheduler_outputs, output)
+
+        # Tracing
+        self.do_tracing(scheduler_outputs)
+
+        if not self.has_unfinished_requests():
+            # Stop the execute model loop in parallel workers until there are
+            # more requests to process. This avoids waiting indefinitely in
+            # torch.distributed ops which may otherwise timeout, and unblocks
+            # the RPC thread in the workers so that they can process any other
+            # queued control plane messages, such as add/remove lora adapters.
+            self.model_executor.stop_remote_worker_execution_loop()
+        return request_outputs
+
 class YuanAsyncLLMEngine(LLMEngine):
     async def step_async(
         self, virtual_engine: int
@@ -221,7 +241,6 @@ def fused_moe_yuan(
     assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
 
     top_logits, topk_ids = torch.topk(gating_output, topk, dim=-1)
-    #top_logits, topk_ids = torch.topk(gating_output, topk, dim=1)
     topk_weights = torch.softmax(top_logits,
                                     dim=-1,
                                     dtype=torch.float32)
@@ -252,7 +271,7 @@ class RMSNorm(torch.nn.Module):
     def forward(self, hidden_states):
         variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-
+        
         # convert into half-precision if necessary
         if self.weight.dtype in [torch.float16, torch.bfloat16]:
             hidden_states = hidden_states.to(self.weight.dtype)
@@ -405,6 +424,197 @@ class YuanExperts(nn.Module):
                 final_hidden_states)
         return final_hidden_states
 
+class MoEDroplessTokenDispatcher:
+    def __init__(self, config: YuanConfig) -> None:
+        
+        self.num_experts = config.moe_config['moe_num_experts']
+        assert self.num_experts > 0, "Expected at least one expert"
+        self.router_topk = config.moe_config['moe_top_k']
+
+    def token_permutation(
+        self, hidden_states: torch.Tensor, max_prob: torch.Tensor, max_ind: torch.Tensor
+    ):
+        self.hidden_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+
+        if self.router_topk > 1:
+            global_local_map = torch.ones_like(max_ind).bool()
+            local_indices = max_ind.masked_select(global_local_map)
+            local_probs = max_prob.masked_select(global_local_map)
+            global_local_map = global_local_map.nonzero()[:, 0]
+            global_local_map = global_local_map.view(-1, 1).expand(-1, hidden_states.shape[-1])
+            local_hidden_states = torch.gather(hidden_states, 0, global_local_map)
+
+        indices = torch.argsort(local_indices, dim=0)
+        tokens_per_expert = torch.histc(
+            local_indices,
+            bins=self.num_experts,
+            min=0,
+            max=self.num_experts - 1,
+        )
+        tokens_per_expert = tokens_per_expert.cpu().to(torch.long)
+
+        indices = indices.view(-1, 1).expand(-1, hidden_states.shape[-1])
+        permuted_local_hidden_states = torch.gather(local_hidden_states, 0, indices)
+        return (permuted_local_hidden_states, tokens_per_expert, local_probs, indices, global_local_map)
+
+    def token_unpermutation(
+        self,
+        hidden_states: torch.Tensor,
+        scores: torch.Tensor,
+        indices: torch.Tensor,
+        global_local_map: torch.Tensor = None,
+    ):
+        scores = scores.to(dtype=hidden_states.dtype)
+        unpermuted_local_hidden = torch.zeros_like(hidden_states)
+        assert indices.shape == hidden_states.shape, f'{indices.shape}, {hidden_states.shape}'
+        unpermuted_local_hidden = unpermuted_local_hidden.scatter(0, indices, hidden_states)
+
+        if self.router_topk > 1:
+            unpermuted_local_hidden = unpermuted_local_hidden * scores.view(-1, 1)
+
+        unpermuted_local_bias = None
+        output_total = unpermuted_local_hidden
+        output_bias_total = unpermuted_local_bias
+
+        if self.router_topk > 1:
+            global_num_tokens = self.hidden_shape[0]# * self.hidden_shape[1]
+            global_hidden_shape = [global_num_tokens, hidden_states.shape[-1]]
+            unpermuted_global_hidden = torch.zeros(
+                global_hidden_shape,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            output_total = unpermuted_global_hidden.scatter_add(
+                0, global_local_map, unpermuted_local_hidden
+            )
+
+        output_total = output_total.view(self.hidden_shape)
+
+        return output_total
+
+class GroupedMLP(nn.Module):
+    """An efficient implementation of the Experts layer using CUTLASS GroupedGEMM.
+
+    This class is designed to execute multiple experts in parallel, thereby maximizing computational efficiency.
+    """
+
+    def __init__(self, config: YuanConfig, params_dtype: Optional[torch.dtype] = None,):
+        super().__init__()
+        self.num_experts = config.moe_config['moe_num_experts']
+        self.hidden_size = config.hidden_size
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.intermediate_size = (config.moe_config['ffn_hidden_size'] //
+                                  self.tp_size)
+        def glu(x):
+            x = torch.chunk(x, 2, dim=-1)
+            return torch.nn.functional.silu(x[0]) * x[1]
+
+        self.activation_func = glu
+        self.ffn_hidden_size = config.moe_config['ffn_hidden_size']
+        fc1_output_size_per_partition = self.ffn_hidden_size * 2
+        fc2_input_size = self.ffn_hidden_size
+        
+        if params_dtype is None:
+            params_dtype = torch.get_default_dtype()
+        self.params_dtype = params_dtype
+        #self.w1 = nn.Parameter(torch.empty(self.num_experts, config.hidden_size, self.ffn_hidden_size * 2, device="cuda", dtype=self.params_dtype))
+        #self.w2 = nn.Parameter(torch.empty(self.num_experts, self.ffn_hidden_size, config.hidden_size, device="cuda", dtype=self.params_dtype))
+        self.w1 = nn.Parameter(
+            torch.empty(
+                self.num_experts,
+                self.hidden_size,
+                2 * self.intermediate_size,
+                device="cuda",
+                dtype=self.params_dtype,
+            ))
+        self.w2 = nn.Parameter(
+            torch.empty(
+                self.num_experts,
+                self.intermediate_size,
+                self.hidden_size,
+                device="cuda",
+                dtype=self.params_dtype,
+            ))
+
+        set_weight_attrs(
+            self.w1,
+            {
+                "weight_loader": self.weight_loader,
+            },
+        )
+        set_weight_attrs(
+            self.w2,
+            {
+                "weight_loader": self.weight_loader,
+            },
+        )
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
+                      weight_name: str):
+        tp_rank = get_tensor_model_parallel_rank()
+        param_data = param.data
+        if weight_name.endswith("w1"):
+            chunk_size = loaded_weight.shape[2] // 2
+            chunk0 = torch.split(loaded_weight, chunk_size, dim=2)[0].clone().detach()
+            chunk1 = torch.split(loaded_weight, chunk_size, dim=2)[1].clone().detach()
+            sub_chunk_size = param_data.shape[2] // 2
+            sub_chunk0 = torch.split(chunk0, sub_chunk_size, dim=2)[tp_rank].clone().detach()
+            sub_chunk1 = torch.split(chunk1, sub_chunk_size, dim=2)[tp_rank].clone().detach()
+            param_data.copy_(torch.cat([sub_chunk0, sub_chunk1], dim=2))#.permute(0, 2, 1))
+
+        if weight_name.endswith("w2"):
+            chunk_size = loaded_weight.shape[1] // self.tp_size
+            sub_chunk = torch.split(loaded_weight, chunk_size, dim=1)[tp_rank].clone().detach()
+            param_data.copy_(sub_chunk)#.permute(0, 2, 1))
+
+    def forward(self, permuted_hidden_states, tokens_per_expert):
+        torch.cuda.set_device(permuted_hidden_states.device)
+        permuted_hidden_states = permuted_hidden_states#.to('cuda:0')
+            
+        fc1_output = gg.ops.gmm(permuted_hidden_states, self.w1, tokens_per_expert.cpu(), trans_b=False)
+        intermediate_parallel = self.activation_func(fc1_output)
+        fc2_output = gg.ops.gmm(intermediate_parallel, self.w2, tokens_per_expert.cpu(), trans_b=False)
+        if self.tp_size > 1: 
+            fc2_output = tensor_model_parallel_all_reduce(fc2_output)
+        return fc2_output#.to('cuda:1')
+
+class YuanMoeLayer(nn.Module):
+    def __init__(self, config:YuanConfig):
+        super().__init__()
+        self.num_experts = config.moe_config['moe_num_experts']
+        self.top_k = config.moe_config['moe_top_k']
+        self.norm_topk_prob = config.moe_config['norm_topk_prob']
+        self.hidden_size = config.hidden_size
+
+        expert_indices_offset = (0)
+
+        self.gate = ParallelAttention_router(config)
+        self.token_dispatcher = MoEDroplessTokenDispatcher(config)
+        self.experts = GroupedMLP(config)
+
+        #self.token_dispatcher = MoEDroplessTokenDispatcher(
+        #    self.num_experts, self.expert_indices, config=self.config
+        #)
+
+    def routing(self, logits: torch.Tensor) -> torch.Tensor:
+        top_logits, indices = torch.topk(logits, k=self.top_k, dim=1)
+        scores = torch.softmax(top_logits, dim=-1, dtype=torch.float32).type_as(logits)
+        return scores, indices
+
+    def forward(self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata) -> torch.Tensor:
+        #if hidden_states.shape == torch.Size([6, 2048]):
+        #    import pdb;pdb.set_trace()
+        sequence_length, hidden_dim = hidden_states.shape
+        logits = self.gate(hidden_states, attn_metadata)
+        scores, indices = self.routing(logits)
+        scores = scores.to(hidden_states.dtype)
+        (dispatched_input, tokens_per_expert, scores, indices, global_local_map, ) = self.token_dispatcher.token_permutation(hidden_states, scores, indices)
+
+        expert_output = self.experts(dispatched_input, tokens_per_expert)
+        output = self.token_dispatcher.token_unpermutation(expert_output, scores, indices, global_local_map)
+        return output
+
 def _yarn_find_correction_dim(num_rotations, dim, base=10000, max_position_embeddings=2048):
     return (dim * math.log(max_position_embeddings/(num_rotations * 2 * math.pi)))/(2 * math.log(base))
 
@@ -492,18 +702,21 @@ class YuanYaRNScaledRotaryEmbedding(nn.Module):
 
 class YuanRotaryEmbedding(nn.Module):
 
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim, base=10000, dtype=torch.float32):
         super().__init__()
         self.base = base
         self.dim = dim
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = (1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))).to(dtype)
         self.register_buffer('inv_freq', inv_freq)
 
     def forward(self, x, max_seq_len, offset=0):
+        self.inv_freq = self.inv_freq.to(torch.float32)
         seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
         freqs = einsum('i , j -> i j', seq.float(), self.inv_freq)
+        #freqs = einsum('i , j -> i j', seq.type_as(self.inv_freq), self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb[:, None, :].float()
+        #return emb[:, None, None, :]
 
 def _rotate_half(x):
     """
@@ -523,7 +736,6 @@ def apply_rotary_pos_emb(x, freqs, position_ids, use_yarn, yarn_scale_factor, at
     x = (x * freqs.cos() * mscale) + (_rotate_half(x) * freqs.sin() * mscale)
     return torch.cat((x, x_pass), dim=-1).to(data_type)
 
-
 class LocalizedFiltering(torch.nn.Module):
     """
     Mega's Exponential Moving Average layer, largely left unmodified from the original repo with the exception of
@@ -531,11 +743,12 @@ class LocalizedFiltering(torch.nn.Module):
     "https://arxiv.org/abs/2209.10655" for more details.
     """
 
-    def __init__(self, config, hidden_size):
+    def __init__(self, config, hidden_size, lf_conv2d_group, lf_conv2d_num_pad):
         super().__init__()
+
         self.embed_dim = hidden_size
-        self.lf_conv2d_group = 1
-        self.lf_conv2d_num_pad = 0
+        self.lf_conv2d_group = lf_conv2d_group
+        self.lf_conv2d_num_pad = lf_conv2d_num_pad
         self.conv1 = torch.nn.Conv2d(
             self.embed_dim,
             self.embed_dim // 2,
@@ -649,6 +862,9 @@ class YuanAttention(nn.Module):
         self.hidden_size = hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
+        self.lf_conv2d_group = config.lf_conv2d_group
+        self.lf_conv2d_num_pad = config.lf_conv2d_num_pad
+
         self.attn_head_size = attention_projection_size // num_heads if attn_head_size is None else attn_head_size
         assert self.total_num_heads % self.tp_size == 0
         self.num_heads = self.total_num_heads // self.tp_size
@@ -685,7 +901,7 @@ class YuanAttention(nn.Module):
         )
         
         self.model_type = getattr(config, 'model_type', 'yuan')
-        self.lf_gate = LocalizedFiltering(self.config, self.hidden_size)
+        self.lf_gate = LocalizedFiltering(self.config, self.hidden_size, self.lf_conv2d_group, self.lf_conv2d_num_pad)
         self.attn = Attention(self.num_kv_heads,
                               self.attn_head_size,
                               self.scaling,
@@ -750,7 +966,8 @@ class YuanDecoderLayer(nn.Module):
         self.use_moe = getattr(config, "use_moe", False)
         if self.use_moe:
             #self.mlp = YuanExperts(config, quant_config=quant_config)
-            self.mlp = YuanExperts(config, linear_method)
+            #self.mlp = YuanExperts(config, linear_method)
+            self.mlp = YuanMoeLayer(config)
         else:
             self.mlp = YuanMLP(
                 hidden_size=self.hidden_size,
@@ -778,9 +995,16 @@ class YuanDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         #if hidden_states.shape == torch.Size([6, 2048]):
+        #    print("mlp:", self.mlp(hidden_states, attn_metadata))
         #    import pdb;pdb.set_trace()
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        #if hidden_states.shape == torch.Size([6, 2048]):
+        #    print(hidden_states)
+        #if hidden_states.shape == torch.Size([6, 2048]):
+        #    hidden_states = residual + hidden_states
+        #    hidden_states = self.post_attention_layernorm(hidden_states)
+        #    hidden_states = self.mlp(hidden_states, attn_metadata)
         hidden_states, lf1, lf2 = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -793,14 +1017,12 @@ class YuanDecoderLayer(nn.Module):
             yarn_scale_factor=yarn_scale_factor,
             attn_factor=attn_factor
         )
-        #print("attn_hidden_states.shape:", hidden_states.shape, "attn_hidden_states:", hidden_states)
         hidden_states = residual + hidden_states
         
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states, attn_metadata)
-        #print("mlp_hidden_states.shape:", hidden_states.shape, "mlp_hidden_states:", hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states, lf1, lf2
 
@@ -1024,7 +1246,7 @@ class YuanForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
-        q_projs, k_projs= {}, {}
+        qk = {}
 
         if self.use_moe:
             moe_state_dict = {}
@@ -1035,6 +1257,11 @@ class YuanForCausalLM(nn.Module):
                 if 'mlp' in name:
                     moe_state_dict[name] = loaded_weight
                     continue
+            if "get_query_key" in name:
+                #print(name)
+                #name = name.replace('get_query_key', 'get_query_key.weight')
+                qk[name] = loaded_weight.permute(1, 0)
+                continue
             param = params_dict[name]
             if name.endswith(".bias") and name not in params_dict:
                 continue
@@ -1042,20 +1269,33 @@ class YuanForCausalLM(nn.Module):
                                     default_weight_loader)
             weight_loader(param, loaded_weight)
             tp_rank = get_tensor_model_parallel_rank()
+        
+        for i in range(self.config.num_hidden_layers):
+            hf_name = f'model.layers.{i}.self_attn.get_query_key'
+            qk_weight = qk[hf_name]
+            #print("qk_weight:", qk_weight.shape)
+            name = f'model.layers.{i}.self_attn.get_query_key.weight'
+            param = params_dict[name]
+            #print("params_dict", params_dict[name].shape)
+            weight_loader = getattr(param, "weight_loader",
+                                    default_weight_loader)
+            weight_loader(param, qk_weight)
         if self.use_moe:
             for layer_id in range(self.config.num_hidden_layers):
+                hf_name = f'model.layers.{layer_id}.mlp.gate.query_key_value'
                 name = f'model.layers.{layer_id}.mlp.gate.query_key_value.weight'
                 param = params_dict[name]
+                #print("loaded:", moe_state_dict[hf_name].shape, "param:", param.shape)
                 weight_loader = getattr(param, 'weight_loader', default_weight_loader)
-                weight_loader(param, moe_state_dict[name])
-
+                weight_loader(param, moe_state_dict[hf_name].permute(1, 0))
+                '''
                 experts = []
                 for expert_id in range(self.config.moe_config['moe_num_experts']):
                     hf_name = f'model.layers.{layer_id}.mlp.experts.w1.{expert_id}.weight'
                     experts.append(moe_state_dict[hf_name].T.unsqueeze(0))#.view(1, *moe_state_dict[hf_name].shape)
                 experts_weight = torch.cat(experts, dim=0)
-                name = f'model.layers.{layer_id}.mlp.w1'
-                #name = f'model.layers.{layer_id}.mlp.experts.w1'
+                #name = f'model.layers.{layer_id}.mlp.w1'
+                name = f'model.layers.{layer_id}.mlp.experts.w1'
                 param = params_dict[name]
                 weight_loader = getattr(param, 'weight_loader', default_weight_loader)
                 weight_loader(param, experts_weight, name)
@@ -1065,8 +1305,24 @@ class YuanForCausalLM(nn.Module):
                     hf_name = f'model.layers.{layer_id}.mlp.experts.w2.{expert_id}.weight'
                     experts.append(moe_state_dict[hf_name].T.unsqueeze(0))#.view(1, *moe_state_dict[hf_name].shape)
                 experts_weight = torch.cat(experts, dim=0)
-                name = f'model.layers.{layer_id}.mlp.w2'
-                #name = f'model.layers.{layer_id}.mlp.experts.w2'
+                #name = f'model.layers.{layer_id}.mlp.w2'
+                name = f'model.layers.{layer_id}.mlp.experts.w2'
                 param = params_dict[name]
                 weight_loader = getattr(param, 'weight_loader', default_weight_loader)
                 weight_loader(param, experts_weight, name)
+                '''
+                for expert_id in range(self.config.moe_config['moe_num_experts']):
+                    #name = f'model.layers.{layer_id}.mlp.experts.w1.{expert_id}.weight'
+                    hf_name_w1 = f'model.layers.{layer_id}.mlp.experts.weight1'
+                    name_w1 = f'model.layers.{layer_id}.mlp.experts.w1'
+                    param = params_dict[name_w1]
+                    weight_loader = getattr(param, 'weight_loader', default_weight_loader)
+                    weight_loader(param, moe_state_dict[hf_name_w1], name_w1)
+
+                    #name = f'model.layers.{layer_id}.mlp.experts.w2.{expert_id}.weight'
+                    hf_name_w2 = f'model.layers.{layer_id}.mlp.experts.weight2'
+                    name_w2 = f'model.layers.{layer_id}.mlp.experts.w2'
+                    param = params_dict[name_w2]
+                    weight_loader = getattr(param, 'weight_loader', default_weight_loader)
+                    weight_loader(param, moe_state_dict[hf_name_w2], name_w2)
+

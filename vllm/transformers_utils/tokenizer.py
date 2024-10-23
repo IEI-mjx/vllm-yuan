@@ -2,7 +2,7 @@ import os
 from typing import Optional, Union
 
 import huggingface_hub
-from transformers import (AutoTokenizer, PreTrainedTokenizer,
+from transformers import (AutoTokenizer, PreTrainedTokenizer, LlamaTokenizer,
                           PreTrainedTokenizerFast)
 
 from vllm.envs import VLLM_USE_MODELSCOPE
@@ -61,7 +61,6 @@ def get_tokenizer(
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
     download_dir: Optional[str] = None,
-    model_type: str = None,
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via HuggingFace or ModelScope.
@@ -89,10 +88,14 @@ def get_tokenizer(
                 "Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
 
+    if "truncation_side" not in kwargs:
+        kwargs["truncation_side"] = "left"
+
     try:
-        if model_type == 'yuan':
+        if 'Yuan' in tokenizer_name:
             tokenizer = LlamaTokenizer.from_pretrained(tokenizer_name, add_eos_token=False, add_bos_token=False, eos_token='<eod>')
             tokenizer.add_tokens(['<sep>', '<pad>', '<mask>', '<predict>', '<FIM_SUFFIX>', '<FIM_PREFIX>', '<FIM_MIDDLE>','<commit_before>','<commit_msg>','<commit_after>','<jupyter_start>','<jupyter_text>','<jupyter_code>','<jupyter_output>','<empty_output>'], special_tokens=True)
+            print('-----------------using yuan tokenizer-----------------')
         else:
             tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_name,
@@ -139,14 +142,13 @@ def get_lora_tokenizer(lora_request: LoRARequest, *args,
     if lora_request is None:
         return None
     try:
-        tokenizer = get_tokenizer(lora_request.lora_local_path, *args,
-                                  **kwargs)
+        tokenizer = get_tokenizer(lora_request.lora_path, *args, **kwargs)
     except OSError as e:
         # No tokenizer was found in the LoRA folder,
         # use base model tokenizer
         logger.warning(
             "No tokenizer found in %s, using base model tokenizer instead. "
-            "(Exception: %s)", lora_request.lora_local_path, e)
+            "(Exception: %s)", lora_request.lora_path, e)
         tokenizer = None
     return tokenizer
 
