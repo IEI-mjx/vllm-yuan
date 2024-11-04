@@ -324,8 +324,8 @@ class GroupedMLP(nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
 
-        self.w1 = nn.ModuleList([ColumnParallelLinear(config.hidden_size, self.ffn_hidden_size * 2, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
-        self.w2 = nn.ModuleList([RowParallelLinear(self.ffn_hidden_size, config.hidden_size, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
+        self.w1 = nn.ModuleList([ReplicatedLinear(config.hidden_size, self.ffn_hidden_size * 2, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
+        self.w2 = nn.ModuleList([ReplicatedLinear(self.ffn_hidden_size, config.hidden_size, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
         ''' 
         self.w1 = nn.Parameter(
             torch.empty(
@@ -401,8 +401,8 @@ class GroupedMLP(nn.Module):
             fc2_outputs.append(fc2_output)
             start_idx = end_idx
         fc2_output = torch.cat(fc2_outputs, dim=0)
-        if self.tp_size > 1:
-            fc2_output = tensor_model_parallel_all_reduce(fc2_output)
+        #if self.tp_size > 1:
+        #    fc2_output = tensor_model_parallel_all_reduce(fc2_output)
         return fc2_output#.to('cuda:1')
 
 class YuanMoeLayer(nn.Module):
