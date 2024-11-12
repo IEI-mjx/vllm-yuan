@@ -324,8 +324,8 @@ class GroupedMLP(nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
 
-        self.w1 = nn.ModuleList([ReplicatedLinear(config.hidden_size, self.ffn_hidden_size * 2, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
-        self.w2 = nn.ModuleList([ReplicatedLinear(self.ffn_hidden_size, config.hidden_size, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
+        self.w1 = nn.ModuleList([ReplicatedLinear(config.hidden_size, self.intermediate_size * 2, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
+        self.w2 = nn.ModuleList([ReplicatedLinear(self.intermediate_size, config.hidden_size, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
         
         set_weight_attrs(
             self.w1,
@@ -378,8 +378,8 @@ class GroupedMLP(nn.Module):
             fc2_outputs.append(fc2_output)
             start_idx = end_idx
         fc2_output = torch.cat(fc2_outputs, dim=0)
-        #if self.tp_size > 1:
-        #    fc2_output = tensor_model_parallel_all_reduce(fc2_output)
+        if self.tp_size > 1:
+            fc2_output = tensor_model_parallel_all_reduce(fc2_output)
         return fc2_output#.to('cuda:1')
 
 class YuanMoeLayer(nn.Module):
@@ -1015,15 +1015,43 @@ class YuanForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
-        if self.use_moe:
-            moe_state_dict = {}
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
         for name, loaded_weight in weights:
             if "rotary_pos_emb" in name:
                 continue
             if name.endswith(".bias") and name not in params_dict:
                 continue
             param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader",
-                                    default_weight_loader)
-            weight_loader(param, loaded_weight)
-            tp_rank = get_tensor_model_parallel_rank()
+            param_data = param.data
+            if 'w1' in name:
+                    chunk_size = loaded_weight.shape[0] // 2
+                    chunk0 = torch.split(loaded_weight, chunk_size, dim=0)[0].clone().detach()
+                    chunk1 = torch.split(loaded_weight, chunk_size, dim=0)[1].clone().detach()
+                    sub_chunk_size = param_data.shape[0] // 2
+                    sub_chunk0 = torch.split(chunk0, sub_chunk_size, dim=0)[tp_rank].clone().detach()
+                    sub_chunk1 = torch.split(chunk1, sub_chunk_size, dim=0)[tp_rank].clone().detach()
+                    param_data.copy_(torch.cat([sub_chunk0, sub_chunk1], dim=0))
+            elif 'w2' in name:
+                if 'weight_scale' in name:
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                else:
+                    chunk_size = loaded_weight.shape[1] // tp_size
+                    sub_chunk = torch.split(loaded_weight, chunk_size, dim=1)[tp_rank].clone().detach()
+                    param_data.copy_(sub_chunk)
+            else:
+                '''
+                if 'get_query_key.weight_scale' in name or 'v_proj.weight_scale' in name:
+                    chunk_size = loaded_weight.shape[0] // tp_size
+                    sub_chunk = torch.split(loaded_weight, chunk_size, dim=0)[tp_rank].clone().detach()
+                    param_data.copy_(sub_chunk)
+                else:
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                '''
+                weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                weight_loader(param, loaded_weight)
