@@ -323,29 +323,12 @@ class GroupedMLP(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
+        
+        #self.w1 = nn.ModuleList([ColumnParallelLinear(config.hidden_size, self.ffn_hidden_size * 2, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
+        #self.w2 = nn.ModuleList([RowParallelLinear(self.ffn_hidden_size, config.hidden_size, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
+        self.w1 = nn.ModuleList([ReplicatedLinear(config.hidden_size, self.intermediate_size * 2, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
+        self.w2 = nn.ModuleList([ReplicatedLinear(self.intermediate_size, config.hidden_size, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
 
-        self.w1 = nn.ModuleList([ReplicatedLinear(config.hidden_size, self.ffn_hidden_size * 2, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
-        self.w2 = nn.ModuleList([ReplicatedLinear(self.ffn_hidden_size, config.hidden_size, bias=False, quant_config=quant_config) for _ in range(self.num_experts)])
-        ''' 
-        self.w1 = nn.Parameter(
-            torch.empty(
-                self.num_experts,
-                self.hidden_size,
-                2 * self.intermediate_size,
-                #self.hidden_size,
-                device="cuda",
-                dtype=self.params_dtype,
-            ))
-        self.w2 = nn.Parameter(
-            torch.empty(
-                self.num_experts,
-                #self.hidden_size,
-                self.intermediate_size,
-                self.hidden_size,
-                device="cuda",
-                dtype=self.params_dtype,
-            ))
-        '''
         set_weight_attrs(
             self.w1,
             {
@@ -359,17 +342,18 @@ class GroupedMLP(nn.Module):
             },
         )
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
+    def weight_loader(self, param: nn.Linear, loaded_weight: torch.Tensor,
                       weight_name: str):
+        print('-------------------using Expert Weight loader----------------------------')
         tp_rank = get_tensor_model_parallel_rank()
         param_data = param.data
         if weight_name.endswith("w1"):
             chunk_size = loaded_weight.shape[2] // 2
-            #print("loaded_weight:", loaded_weight.shape)
+            print("loaded_weight:", loaded_weight.shape)
             chunk0 = torch.split(loaded_weight, chunk_size, dim=2)[0].clone().detach()
             chunk1 = torch.split(loaded_weight, chunk_size, dim=2)[1].clone().detach()
             #print("chunk0:", chunk0.shape)
-            #print("param_data:", param_data.shape)
+            print("param_data:", param_data.shape)
             sub_chunk_size = param_data.shape[2] // 2
             sub_chunk0 = torch.split(chunk0, sub_chunk_size, dim=2)[tp_rank].clone().detach()
             sub_chunk1 = torch.split(chunk1, sub_chunk_size, dim=2)[tp_rank].clone().detach()
@@ -384,7 +368,7 @@ class GroupedMLP(nn.Module):
     def forward(self, permuted_hidden_states, tokens_per_expert):
         torch.cuda.set_device(permuted_hidden_states.device)
         permuted_hidden_states = permuted_hidden_states#.to('cuda:0')
-
+        
         fc2_outputs = []
         start_idx = 0
         for i in range(self.num_experts):
@@ -401,8 +385,11 @@ class GroupedMLP(nn.Module):
             fc2_outputs.append(fc2_output)
             start_idx = end_idx
         fc2_output = torch.cat(fc2_outputs, dim=0)
-        #if self.tp_size > 1:
-        #    fc2_output = tensor_model_parallel_all_reduce(fc2_output)
+        #if permuted_hidden_states == torch.Size([12, 2048]):
+        #print('1', fc1_output, self.w1[0].weight.shape)
+        #print('2', fc2_output, self.w2[0].weight.shape)
+        if self.tp_size > 1:
+            fc2_output = tensor_model_parallel_all_reduce(fc2_output)
         return fc2_output#.to('cuda:1')
 
 class YuanMoeLayer(nn.Module):
@@ -431,7 +418,7 @@ class YuanMoeLayer(nn.Module):
         scores, indices = self.routing(logits)
         scores = scores.to(hidden_states.dtype)
         (dispatched_input, tokens_per_expert, scores, indices, global_local_map, ) = self.token_dispatcher.token_permutation(hidden_states, scores, indices)
-
+        
         expert_output = self.experts(dispatched_input, tokens_per_expert)
         output = self.token_dispatcher.token_unpermutation(expert_output, scores, indices, global_local_map)
         return output
@@ -809,6 +796,8 @@ class YuanDecoderLayer(nn.Module):
         # Self Attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        #if hidden_states.shape == torch.Size([6, 2048]):
+        #    print('mlp:', self.mlp(hidden_states, attn_metadata))
         hidden_states, lf1, lf2 = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -821,6 +810,8 @@ class YuanDecoderLayer(nn.Module):
             yarn_scale_factor=yarn_scale_factor,
             attn_factor=attn_factor
         )
+        #if hidden_states.shape == torch.Size([6, 2048]):
+        #    print('attn:', hidden_states)
         hidden_states = residual + hidden_states
         
         # Fully Connected
@@ -1038,90 +1029,43 @@ class YuanForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
-        '''
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("get_query_key", "q_proj", "q"),
-            ("get_query_key", "k_proj", "k"),
-        ]
-        '''
-        #for name in params_dict.keys():
-        #    print(name)
-        if self.use_moe:
-            moe_state_dict = {}
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
         for name, loaded_weight in weights:
             if "rotary_pos_emb" in name:
                 continue
-            '''
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            if self.use_moe:
-                if 'mlp' in name:
-                    moe_state_dict[name] = loaded_weight
-                    continue
-            '''
             if name.endswith(".bias") and name not in params_dict:
                 continue
             param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader",
-                                    default_weight_loader)
-            weight_loader(param, loaded_weight)
-            tp_rank = get_tensor_model_parallel_rank()
-        '''
-        if self.use_moe:
-            for layer_id in range(self.config.num_hidden_layers):
-                name = f'model.layers.{layer_id}.mlp.gate.query_key_value.weight'
-                param = params_dict[name]
-                weight_loader = getattr(param, 'weight_loader', default_weight_loader)
-                weight_loader(param, moe_state_dict[name])
-                for expert_id in range(self.config.moe_config['moe_num_experts']):
-                    hf_name = f'model.layers.{layer_id}.mlp.experts.w1.{expert_id}.weight'
-                
-                experts = []
-                experts_scale = []
-                for expert_id in range(self.config.moe_config['moe_num_experts']):
-                    hf_name = f'model.layers.{layer_id}.mlp.experts.w1.{expert_id}.weight'
-                    hf_name_scale = f'model.layers.{layer_id}.mlp.experts.w1.{expert_id}.weight_scale'
-                    experts.append(moe_state_dict[hf_name].T.unsqueeze(0))#.view(1, *moe_state_dict[hf_name].shape)
-                    experts_scale.append(moe_state_dict[hf_name_scale].T.unsqueeze(0))
-
-                experts_weight = torch.cat(experts, dim=0)
-                experts_weight_scale = torch.cat(experts_scale, dim=0)
-                #name = f'model.layers.{layer_id}.mlp.w1'
-                name = f'model.layers.{layer_id}.mlp.experts.w1'
-                param = params_dict[name]
-                weight_loader = getattr(param, 'weight_loader', default_weight_loader)
-                weight_loader(param, experts_weight, name)
-                name = f'model.layers.{layer_id}.mlp.experts.w1.weight_scale'
-                param = params_dict[name]
-                weight_loader = getattr(param, 'weight_loader', default_weight_loader)
-                weight_loader(param, experts_weight_scale, name)
-
-                experts = []
-                experts_scale = []
-                for expert_id in range(self.config.moe_config['moe_num_experts']):
-                    hf_name = f'model.layers.{layer_id}.mlp.experts.w2.{expert_id}.weight'
-                    hf_name_scale = f'model.layers.{layer_id}.mlp.experts.w2.{expert_id}.weight_scale'
-                    experts.append(moe_state_dict[hf_name].T.unsqueeze(0))#.view(1, *moe_state_dict[hf_name].shape)
-                    experts_scale.append(moe_state_dict[hf_name_scale].T.unsqueeze(0))
-                experts_weight = torch.cat(experts, dim=0)
-                experts_weight_scale = torch.cat(experts_scale, dim=0)
-                #name = f'model.layers.{layer_id}.mlp.w2'
-                name = f'model.layers.{layer_id}.mlp.experts.w2'
-                param = params_dict[name]
-                weight_loader = getattr(param, 'weight_loader', default_weight_loader)
-                weight_loader(param, experts_weight, name)
-                name = f'model.layers.{layer_id}.mlp.experts.w2.weight_scale'
-                param = params_dict[name]
-                weight_loader = getattr(param, 'weight_loader', default_weight_loader)
-                weight_loader(param, experts_weight_scale, name)
-        '''
+            param_data = param.data
+            if 'w1' in name:
+                    chunk_size = loaded_weight.shape[0] // 2
+                    chunk0 = torch.split(loaded_weight, chunk_size, dim=0)[0].clone().detach()
+                    chunk1 = torch.split(loaded_weight, chunk_size, dim=0)[1].clone().detach()
+                    sub_chunk_size = param_data.shape[0] // 2
+                    sub_chunk0 = torch.split(chunk0, sub_chunk_size, dim=0)[tp_rank].clone().detach()
+                    sub_chunk1 = torch.split(chunk1, sub_chunk_size, dim=0)[tp_rank].clone().detach()
+                    param_data.copy_(torch.cat([sub_chunk0, sub_chunk1], dim=0))
+            elif 'w2' in name:
+                if 'weight_scale' in name:
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                else:
+                    chunk_size = loaded_weight.shape[1] // tp_size
+                    sub_chunk = torch.split(loaded_weight, chunk_size, dim=1)[tp_rank].clone().detach()
+                    param_data.copy_(sub_chunk)
+            else:
+                '''
+                if 'get_query_key.weight_scale' in name or 'v_proj.weight_scale' in name:
+                    chunk_size = loaded_weight.shape[0] // tp_size
+                    sub_chunk = torch.split(loaded_weight, chunk_size, dim=0)[tp_rank].clone().detach()
+                    param_data.copy_(sub_chunk)
+                else:
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                '''
+                weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                weight_loader(param, loaded_weight)
