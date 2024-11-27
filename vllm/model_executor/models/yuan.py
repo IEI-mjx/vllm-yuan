@@ -557,9 +557,8 @@ class LocalizedFiltering(torch.nn.Module):
     def forward(self, inputs, lf1_cache, lf2_cache, attn_metadata):
         if attn_metadata.prefill_metadata != None:
             sub_list = torch.tensor_split(inputs, attn_metadata.seq_start_loc[1:-1].long().cpu())
-            #sub_list = torch.tensor_split(inputs, attn_metadata.prefill_metadata.seq_start_loc[1:-1].long().cpu())
             sub_list = [torch.nn.functional.pad(x, (0, 0, attn_metadata.max_prefill_seq_len - x.shape[0], 0), "constant", 0) for x in sub_list]
-            #sub_list = [torch.nn.functional.pad(x, (0, 0, attn_metadata.prefill_metadata.max_prefill_seq_len - x.shape[0], 0), "constant", 0) for x in sub_list]
+            #sub_list = [torch.nn.functional.pad(x, (0, 0, 0, attn_metadata.max_prefill_seq_len - x.shape[0]), "constant", 0) for x in sub_list]
             inputs = torch.cat(sub_list)
         
         inputs = inputs.view(lf1_cache.shape[0], -1, inputs.shape[-1]) # [b, s, h]
@@ -587,6 +586,7 @@ class LocalizedFiltering(torch.nn.Module):
             #for i, l in enumerate(attn_metadata.prefill_metadata.seq_lens):
             for i, l in enumerate(attn_metadata.seq_lens):
                 hidden_states_list.append(lf_output[i][-l:])
+                #hidden_states_list.append(lf_output[i][:l]
             lf_output = torch.cat(hidden_states_list)
             #print("seq_lens:", attn_metadata.prefill_metadata.seq_lens)
         lf_output = lf_output.contiguous().view(-1, lf_output.shape[-1])
