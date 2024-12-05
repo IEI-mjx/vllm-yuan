@@ -576,39 +576,61 @@ class LocalizedFiltering(torch.nn.Module):
         self.output_layernorm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
 
     def forward(self, inputs, lf1_cache, lf2_cache, attn_metadata):
+        bsz = attn_metadata.num_prefills + attn_metadata.num_decode_tokens
+        result, lf1_, lf2_ = [], [], []
         if attn_metadata.prefill_metadata != None:
-            sub_list = torch.tensor_split(inputs, attn_metadata.seq_start_loc[1:-1].long().cpu())
-            sub_list = [torch.nn.functional.pad(x, (0, 0, attn_metadata.max_prefill_seq_len - x.shape[0], 0), "constant", 0) for x in sub_list]
-            inputs = torch.cat(sub_list)
-        
-        inputs = inputs.view(lf1_cache.shape[0], -1, inputs.shape[-1]) # [b, s, h]
-        inputs = inputs.permute([1, 0, 2])  # [ s, b, h]
-        residual = inputs
-        old_shape = inputs.shape
-        new_shape = inputs.view(inputs.shape[0], 1, inputs.shape[1], inputs.shape[2]).shape  # [s, 1, b, h]
-        inputs = inputs.view(new_shape).permute([2, 3, 0, 1])  # [b, h, s, 1]
-        inputs = torch.cat([lf1_cache, inputs], dim=2)  # [b, h, s+1, 1]
-        output1 = self.conv1(inputs)
-        output1 = torch.cat([lf2_cache, output1], dim=2)
-        output2 = self.conv2(output1).permute([2, 3, 0, 1])
-        output2 = output2.view(old_shape)
-       
-        assert list(output2.shape) == list(residual.shape), f'{output2.shape}, {residual.shape}'
-        output3 = output2 + residual
-        lf_output = self.output_layernorm(output3)
-        lf_output = lf_output.permute([1, 0, 2])
+            for b in range(bsz):
+                inputs_ = inputs[attn_metadata.prefill_metadata.seq_start_loc[b]:attn_metadata.prefill_metadata.seq_start_loc[b+1]]
+                lf1_cache_ = lf1_cache[b:b+1]
+                lf2_cache_ = lf2_cache[b:b+1]
 
-        lf1 = inputs[:, :, -1:, :].contiguous()
-        lf2 = output1[:, :, -1:, :].contiguous()
-        #if attn_metadata.is_prompt == True:
-        if attn_metadata.prefill_metadata != None:
-            hidden_states_list = []
-            #for i, l in enumerate(attn_metadata.prefill_metadata.seq_lens):
-            for i, l in enumerate(attn_metadata.seq_lens):
-                hidden_states_list.append(lf_output[i][-l:])
-            lf_output = torch.cat(hidden_states_list)
-        lf_output = lf_output.contiguous().view(-1, lf_output.shape[-1])
+                inputs_ = inputs_.view(lf1_cache_.shape[0], -1, inputs_.shape[-1]) # [b, s, h]
+                inputs_ = inputs_.permute([1, 0, 2])  # [ s, b, h]
+                residual = inputs_
+                old_shape = inputs_.shape
+                new_shape = inputs_.view(inputs_.shape[0], 1, inputs_.shape[1], inputs_.shape[2]).shape  # [s, 1, b, h]
+                inputs_ = inputs_.view(new_shape).permute([2, 3, 0, 1])  # [b, h, s, 1]
+                inputs_ = torch.cat([lf1_cache_, inputs_], dim=2)  # [b, h, s+1, 1]
+                output1 = self.conv1(inputs_)
+                output1 = torch.cat([lf2_cache_, output1], dim=2)
+                output2 = self.conv2(output1).permute([2, 3, 0, 1])
+                output2 = output2.view(old_shape)
+
+                assert list(output2.shape) == list(residual.shape), f'{output2.shape}, {residual.shape}'
+                output3 = output2 + residual
+                lf_output = self.output_layernorm(output3)
+                lf_output = lf_output.permute([1, 0, 2])
+
+                lf1 = inputs_[:, :, -1:, :].contiguous()
+                lf2 = output1[:, :, -1:, :].contiguous()
+                lf1_.append(lf1)
+                lf2_.append(lf2)
+                result.append(lf_output.view(-1, *lf_output.shape[2:]))
+            lf_output = torch.cat(result, dim=0)
+            lf1 = torch.cat(lf1_)
+            lf2 = torch.cat(lf2_)
+        else:
+            inputs = inputs.view(lf1_cache.shape[0], -1, inputs.shape[-1]) # [b, s, h]
+            inputs = inputs.permute([1, 0, 2])  # [ s, b, h]
+            residual = inputs
+            old_shape = inputs.shape
+            new_shape = inputs.view(inputs.shape[0], 1, inputs.shape[1], inputs.shape[2]).shape  # [s, 1, b, h]
+            inputs = inputs.view(new_shape).permute([2, 3, 0, 1])  # [b, h, s, 1]
+            inputs = torch.cat([lf1_cache, inputs], dim=2)  # [b, h, s+1, 1]
+            output1 = self.conv1(inputs)
+            output1 = torch.cat([lf2_cache, output1], dim=2)
+            output2 = self.conv2(output1).permute([2, 3, 0, 1])
+            output2 = output2.view(old_shape)
+
+            assert list(output2.shape) == list(residual.shape), f'{output2.shape}, {residual.shape}'
+            output3 = output2 + residual
+            lf_output = self.output_layernorm(output3)
+            lf_output = lf_output.permute([1, 0, 2])
+
+            lf1 = inputs[:, :, -1:, :].contiguous()
+            lf2 = output1[:, :, -1:, :].contiguous()
         return lf_output, lf1, lf2
+
 
 class YuanMLP(nn.Module):
 
@@ -730,6 +752,7 @@ class YuanAttention(nn.Module):
     ) -> torch.Tensor:
         v, _ = self.v_proj(hidden_states)
         hidden_states, lf1, lf2 = self.lf_gate(hidden_states, lf1_cache, lf2_cache, attn_metadata)
+        hidden_states = hidden_states.contiguous().view(-1, hidden_states.shape[-1])
         qk, _ = self.get_query_key(hidden_states)
         qk = qk.view(*qk.shape[:-1], self.num_heads, int(qk.shape[-1] // self.num_heads))
         (q, k) = torch.chunk(qk, 2, dim=-1)
@@ -1056,7 +1079,6 @@ class YuanForCausalLM(nn.Module):
                     sub_chunk = torch.split(loaded_weight, chunk_size, dim=1)[tp_rank].clone().detach()
                     param_data.copy_(sub_chunk)
             else:
-                '''
                 if 'get_query_key.weight_scale' in name or 'v_proj.weight_scale' in name:
                     chunk_size = loaded_weight.shape[0] // tp_size
                     sub_chunk = torch.split(loaded_weight, chunk_size, dim=0)[tp_rank].clone().detach()
@@ -1065,7 +1087,3 @@ class YuanForCausalLM(nn.Module):
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
-                '''
-                weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
-                weight_loader(param, loaded_weight)
