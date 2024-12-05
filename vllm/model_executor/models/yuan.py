@@ -39,7 +39,6 @@ import triton
 import triton.language as tl
 
 from vllm import _custom_ops as ops
-#from transformers import YuanConfig
 from vllm.model_executor.models.configuration_yuan import YuanConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.config import LoRAConfig, CacheConfig
@@ -47,7 +46,6 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from transformers.activations import ACT2FN
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.attention import Attention, AttentionMetadata
-#from apex.normalization import MixedFusedRMSNorm as RMSNorm
 from vllm.model_executor.layers.fused_moe import *
 from vllm.model_executor.layers.linear import  (LinearMethodBase,
                                                ColumnParallelLinear,
@@ -76,7 +74,7 @@ from vllm.outputs import EmbeddingRequestOutput, RequestOutput # for api_server
 from vllm.sequence import SequenceData
 from vllm.distributed.communication_op import broadcast_tensor_dict
 from vllm.distributed.parallel_state import get_tensor_model_parallel_group
-import grouped_gemm as gg
+
 # LFCache = Tuple[torch.Tensor, torch.Tensor]
 ### add lf1_caches and lf2_caches in SequenceData for Yuan model
 setattr(SequenceData, "lf1_caches", [])
@@ -84,7 +82,7 @@ setattr(SequenceData, "lf2_caches", [])
 
 global_seq_list = []
 class YuanLLMEngine(LLMEngine):
-    
+
     def step(self):
         if self.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
@@ -181,84 +179,13 @@ class YuanAsyncLLMEngine(LLMEngine):
 
         return request_outputs
 
+
 # hijack LLMEngine.step with YuanLLMEngine.step, use record global_seq_list
 LLMEngine.step = YuanLLMEngine.step
 _AsyncLLMEngine.step_async = YuanAsyncLLMEngine.step_async # api_server use
 
 logger = init_logger(__name__)
 LFCache_type = List[torch.Tensor]
-
-def fused_moe_yuan(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    inplace: bool = False,
-    override_config: Optional[Dict[str, Any]] = None,
-    use_grouped_topk: bool = False,
-    num_expert_group: Optional[int] = None,
-    topk_group: Optional[int] = None,
-    use_fp8: bool = False,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    model_type: str = None,
-) -> torch.Tensor:
-    """
-    This function computes a Mixture of Experts (MoE) layer using two sets of
-    weights, w1 and w2, and top-k gating mechanism.
-
-    Parameters:
-    - hidden_states (torch.Tensor): The input tensor to the MoE layer.
-    - w1 (torch.Tensor): The first set of expert weights.
-    - w2 (torch.Tensor): The second set of expert weights.
-    - gating_output (torch.Tensor): The output of the gating operation
-        (before softmax).
-    - topk (int): The number of top-k experts to select.
-    - renormalize (bool): If True, renormalize the top-k weights to sum to 1.
-    - inplace (bool): If True, perform the operation in-place.
-        Defaults to False.
-    - override_config (Optional[Dict[str, Any]]): Optional override
-        for the kernel configuration.
-    - num_expert_group: Optional[int]: additional parameter for grouped_topk
-    - topk_group: Optional[int]: additional parameter for grouped_topk
-    - use_grouped_topk: If True, use grouped_topk instead of fused_topk
-        note: Deepseekv2 model uses grouped_topk
-    - use_fp8 (bool): If True, use fp8 arithmetic to compute the inner
-        products for w1 and w2. Defaults to False.
-    - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
-        w1.
-    - w2_scale (Optional[torch.Tensor]): Optional scale to be used for
-        w2.
-
-    Returns:
-    - torch.Tensor: The output tensor after applying the MoE layer.
-    """
-    # Check constraints.
-    assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
-
-    top_logits, topk_ids = torch.topk(gating_output, topk, dim=-1)
-    topk_weights = torch.softmax(top_logits,
-                                    dim=-1,
-                                    dtype=torch.float32)
-
-    return fused_experts(hidden_states,
-                         w1,
-                         w2,
-                         topk_weights,
-                         topk_ids,
-                         inplace=inplace,
-                         override_config=override_config,
-                         use_fp8=use_fp8,
-                         w1_scale=w1_scale,
-                         w2_scale=w2_scale,
-                         a1_scale=a1_scale,
-                         a2_scale=a2_scale,
-                         model_type=model_type)
-
 
 
 class RMSNorm(torch.nn.Module):
@@ -277,33 +204,6 @@ class RMSNorm(torch.nn.Module):
             hidden_states = hidden_states.to(self.weight.dtype)
 
         return self.weight * hidden_states
-
-class YuanRouter(nn.Module):
-    """A Router implementation for DBRX that returns logits for each expert
-    per token.
-    """
-
-    def __init__(
-        self,
-        config: YuanConfig,
-        #quant_config: Optional[QuantizationConfig] = None,
-        params_dtype: Optional[torch.dtype] = None,
-    ):
-        super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.num_total_experts = config.moe_config['moe_num_experts']
-        self.hidden_size = config.hidden_size
-        self.layer = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_total_experts,
-            bias=False,
-            params_dtype=params_dtype,
-            #quant_config=quant_config
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits, _ = self.layer(hidden_states)
-        return router_logits
 
 class ParallelAttention_router(nn.Module):
     def __init__(self, config):
@@ -327,102 +227,6 @@ class ParallelAttention_router(nn.Module):
         attn_output = torch.matmul(attn_weights, value_layer)
         router_output = attn_output.squeeze(2)
         return router_output
-
-class YuanExperts(nn.Module):
-    """A tensor-parallel MoE implementation for DBRX.
-
-    Each expert's weights are sharded across all ranks and a fused MoE
-    kernel is used for the forward pass, and finally we reduce the outputs
-    across ranks.
-    """
-
-    def __init__(
-        self,
-        config: YuanConfig,
-        #quant_config: Optional[QuantizationConfig] = None,
-        linear_method: Optional[LinearMethodBase] = None,
-        params_dtype: Optional[torch.dtype] = None,
-    ):
-        super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.num_total_experts = config.moe_config['moe_num_experts']
-        self.top_k = config.moe_config['moe_top_k']
-        self.hidden_size = config.hidden_size 
-        self.intermediate_size = (config.moe_config['ffn_hidden_size'] //
-                                  self.tp_size)
-
-        if params_dtype is None:
-            params_dtype = torch.get_default_dtype()
-        self.params_dtype = params_dtype
-
-        self.gate = ParallelAttention_router(config)
-        self.w1 = nn.Parameter(
-            torch.empty(
-                self.num_total_experts,
-                2 * self.intermediate_size,
-                self.hidden_size,
-                device="cuda",
-                dtype=self.params_dtype,
-            ))
-        self.w2 = nn.Parameter(
-            torch.empty(
-                self.num_total_experts,
-                self.hidden_size,
-                self.intermediate_size,
-                device="cuda",
-                dtype=self.params_dtype,
-            ))
-
-        set_weight_attrs(
-            self.w1,
-            {
-                "weight_loader": self.weight_loader,
-            },
-        )
-        set_weight_attrs(
-            self.w2,
-            {
-                "weight_loader": self.weight_loader,
-            },
-        )
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
-                      weight_name: str):
-        tp_rank = get_tensor_model_parallel_rank()
-        param_data = param.data
-        if weight_name.endswith("w1"):
-            chunk_size = loaded_weight.shape[2] // 2
-            chunk0 = torch.split(loaded_weight, chunk_size, dim=2)[0].clone().detach()
-            chunk1 = torch.split(loaded_weight, chunk_size, dim=2)[1].clone().detach()
-            sub_chunk_size = param_data.shape[1] // 2
-            sub_chunk0 = torch.split(chunk0, sub_chunk_size, dim=2)[tp_rank].clone().detach()
-            sub_chunk1 = torch.split(chunk1, sub_chunk_size, dim=2)[tp_rank].clone().detach()
-            param_data.copy_(torch.cat([sub_chunk0, sub_chunk1], dim=2).permute(0, 2, 1))
-            
-        if weight_name.endswith("w2"):
-            chunk_size = loaded_weight.shape[1] // self.tp_size
-            sub_chunk = torch.split(loaded_weight, chunk_size, dim=1)[tp_rank].clone().detach()
-            param_data.copy_(sub_chunk.permute(0, 2, 1))
-
-    def forward(self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata) -> torch.Tensor:
-        router_logits = self.gate(hidden_states, attn_metadata)
-        final_hidden_states = fused_moe_yuan(
-            hidden_states,
-            self.w1,
-            self.w2,
-            router_logits,
-            self.top_k,
-            renormalize=False,
-            inplace=True,
-            use_grouped_topk=False,
-            #use_fp8=False,
-            model_type='yuan'
-        )
-
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
-        return final_hidden_states
 
 class MoEDroplessTokenDispatcher:
     def __init__(self, config: YuanConfig) -> None:
@@ -478,7 +282,7 @@ class MoEDroplessTokenDispatcher:
         output_bias_total = unpermuted_local_bias
 
         if self.router_topk > 1:
-            global_num_tokens = self.hidden_shape[0]# * self.hidden_shape[1]
+            global_num_tokens = self.hidden_shape[0]
             global_hidden_shape = [global_num_tokens, hidden_states.shape[-1]]
             unpermuted_global_hidden = torch.zeros(
                 global_hidden_shape,
@@ -488,7 +292,6 @@ class MoEDroplessTokenDispatcher:
             output_total = unpermuted_global_hidden.scatter_add(
                 0, global_local_map, unpermuted_local_hidden
             )
-
         output_total = output_total.view(self.hidden_shape)
 
         return output_total
@@ -518,8 +321,7 @@ class GroupedMLP(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
-        #self.w1 = nn.Parameter(torch.empty(self.num_experts, config.hidden_size, self.ffn_hidden_size * 2, device="cuda", dtype=self.params_dtype))
-        #self.w2 = nn.Parameter(torch.empty(self.num_experts, self.ffn_hidden_size, config.hidden_size, device="cuda", dtype=self.params_dtype))
+        
         self.w1 = nn.Parameter(
             torch.empty(
                 self.num_experts,
@@ -536,7 +338,7 @@ class GroupedMLP(nn.Module):
                 device="cuda",
                 dtype=self.params_dtype,
             ))
-
+        
         set_weight_attrs(
             self.w1,
             {
@@ -571,11 +373,22 @@ class GroupedMLP(nn.Module):
     def forward(self, permuted_hidden_states, tokens_per_expert):
         torch.cuda.set_device(permuted_hidden_states.device)
         permuted_hidden_states = permuted_hidden_states#.to('cuda:0')
-            
-        fc1_output = gg.ops.gmm(permuted_hidden_states, self.w1, tokens_per_expert.cpu(), trans_b=False)
-        intermediate_parallel = self.activation_func(fc1_output)
-        fc2_output = gg.ops.gmm(intermediate_parallel, self.w2, tokens_per_expert.cpu(), trans_b=False)
-        if self.tp_size > 1: 
+
+        fc2_outputs = []
+        start_idx = 0
+        for i in range(self.num_experts):
+            if tokens_per_expert[i] == 0:
+                continue
+            end_idx = start_idx + tokens_per_expert[i]
+            # Use custom attributes for each expert's Linear layers
+
+            fc1_output = torch.matmul(permuted_hidden_states[start_idx:end_idx], self.w1[i])
+            intermediate_parallel = self.activation_func(fc1_output)
+            fc2_output = torch.matmul(intermediate_parallel, self.w2[i])
+            fc2_outputs.append(fc2_output)
+            start_idx = end_idx
+        fc2_output = torch.cat(fc2_outputs, dim=0)
+        if self.tp_size > 1:
             fc2_output = tensor_model_parallel_all_reduce(fc2_output)
         return fc2_output#.to('cuda:1')
 
@@ -603,8 +416,6 @@ class YuanMoeLayer(nn.Module):
         return scores, indices
 
     def forward(self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata) -> torch.Tensor:
-        #if hidden_states.shape == torch.Size([6, 2048]):
-        #    import pdb;pdb.set_trace()
         sequence_length, hidden_dim = hidden_states.shape
         logits = self.gate(hidden_states, attn_metadata)
         scores, indices = self.routing(logits)
@@ -768,41 +579,63 @@ class LocalizedFiltering(torch.nn.Module):
         self.output_layernorm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
 
     def forward(self, inputs, lf1_cache, lf2_cache, attn_metadata):
+        bsz = attn_metadata.num_prefills + attn_metadata.num_decode_tokens
+        result, lf1_, lf2_ = [], [], []
         if attn_metadata.prefill_metadata != None:
-            sub_list = torch.tensor_split(inputs, attn_metadata.seq_start_loc[1:-1].long().cpu())
-            #sub_list = torch.tensor_split(inputs, attn_metadata.prefill_metadata.seq_start_loc[1:-1].long().cpu())
-            sub_list = [torch.nn.functional.pad(x, (0, 0, attn_metadata.max_prefill_seq_len - x.shape[0], 0), "constant", 0) for x in sub_list]
-            #sub_list = [torch.nn.functional.pad(x, (0, 0, attn_metadata.prefill_metadata.max_prefill_seq_len - x.shape[0], 0), "constant", 0) for x in sub_list]
-            inputs = torch.cat(sub_list)
-        
-        inputs = inputs.view(lf1_cache.shape[0], -1, inputs.shape[-1]) # [b, s, h]
-        inputs = inputs.permute([1, 0, 2])  # [ s, b, h]
-        residual = inputs
-        old_shape = inputs.shape
-        new_shape = inputs.view(inputs.shape[0], 1, inputs.shape[1], inputs.shape[2]).shape  # [s, 1, b, h]
-        inputs = inputs.view(new_shape).permute([2, 3, 0, 1])  # [b, h, s, 1]
-        inputs = torch.cat([lf1_cache, inputs], dim=2)  # [b, h, s+1, 1]
-        output1 = self.conv1(inputs)
-        output1 = torch.cat([lf2_cache, output1], dim=2)
-        output2 = self.conv2(output1).permute([2, 3, 0, 1])
-        output2 = output2.view(old_shape)
-       
-        assert list(output2.shape) == list(residual.shape), f'{output2.shape}, {residual.shape}'
-        output3 = output2 + residual
-        lf_output = self.output_layernorm(output3)
-        lf_output = lf_output.permute([1, 0, 2])
+            for b in range(bsz):
+                inputs_ = inputs[attn_metadata.prefill_metadata.seq_start_loc[b]:attn_metadata.prefill_metadata.seq_start_loc[b+1]]
+                lf1_cache_ = lf1_cache[b:b+1]
+                lf2_cache_ = lf2_cache[b:b+1]
 
-        lf1 = inputs[:, :, -1:, :].contiguous()
-        lf2 = output1[:, :, -1:, :].contiguous()
-        #if attn_metadata.is_prompt == True:
-        if attn_metadata.prefill_metadata != None:
-            hidden_states_list = []
-            #for i, l in enumerate(attn_metadata.prefill_metadata.seq_lens):
-            for i, l in enumerate(attn_metadata.seq_lens):
-                hidden_states_list.append(lf_output[i][-l:])
-            lf_output = torch.cat(hidden_states_list)
-            #print("seq_lens:", attn_metadata.prefill_metadata.seq_lens)
-        lf_output = lf_output.contiguous().view(-1, lf_output.shape[-1])
+                inputs_ = inputs_.view(lf1_cache_.shape[0], -1, inputs_.shape[-1]) # [b, s, h]
+                inputs_ = inputs_.permute([1, 0, 2])  # [ s, b, h]
+                residual = inputs_
+                old_shape = inputs_.shape
+                new_shape = inputs_.view(inputs_.shape[0], 1, inputs_.shape[1], inputs_.shape[2]).shape  # [s, 1, b, h]
+                inputs_ = inputs_.view(new_shape).permute([2, 3, 0, 1])  # [b, h, s, 1]
+                inputs_ = torch.cat([lf1_cache_, inputs_], dim=2)  # [b, h, s+1, 1]
+                output1 = self.conv1(inputs_)
+                output1 = torch.cat([lf2_cache_, output1], dim=2)
+                output2 = self.conv2(output1).permute([2, 3, 0, 1])
+                output2 = output2.view(old_shape)
+
+                assert list(output2.shape) == list(residual.shape), f'{output2.shape}, {residual.shape}'
+                output3 = output2 + residual
+                #lf_output = output2 + residual
+                lf_output = self.output_layernorm(output3)
+                lf_output = lf_output.permute([1, 0, 2])
+
+                lf1 = inputs_[:, :, -1:, :].contiguous()
+                lf2 = output1[:, :, -1:, :].contiguous()
+                #lf_output = lf_output.contiguous().view(-1, lf_output.shape[-1])
+                lf1_.append(lf1)
+                lf2_.append(lf2)
+                result.append(lf_output.view(-1, *lf_output.shape[2:]))
+            lf_output = torch.cat(result, dim=0)
+            lf1 = torch.cat(lf1_)
+            lf2 = torch.cat(lf2_)
+        else:
+            inputs = inputs.view(lf1_cache.shape[0], -1, inputs.shape[-1]) # [b, s, h]
+            inputs = inputs.permute([1, 0, 2])  # [ s, b, h]
+            residual = inputs
+            old_shape = inputs.shape
+            new_shape = inputs.view(inputs.shape[0], 1, inputs.shape[1], inputs.shape[2]).shape  # [s, 1, b, h]
+            inputs = inputs.view(new_shape).permute([2, 3, 0, 1])  # [b, h, s, 1]
+            inputs = torch.cat([lf1_cache, inputs], dim=2)  # [b, h, s+1, 1]
+            output1 = self.conv1(inputs)
+            output1 = torch.cat([lf2_cache, output1], dim=2)
+            output2 = self.conv2(output1).permute([2, 3, 0, 1])
+            output2 = output2.view(old_shape)
+
+            assert list(output2.shape) == list(residual.shape), f'{output2.shape}, {residual.shape}'
+            output3 = output2 + residual
+            #lf_output = output2 + residual
+            lf_output = self.output_layernorm(output3)
+            lf_output = lf_output.permute([1, 0, 2])
+
+            lf1 = inputs[:, :, -1:, :].contiguous()
+            lf2 = output1[:, :, -1:, :].contiguous()
+            #lf_output = lf_output.contiguous().view(-1, lf_output.shape[-1])
         return lf_output, lf1, lf2
 
 class YuanMLP(nn.Module):
@@ -879,7 +712,7 @@ class YuanAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
-        self.max_position_embeddings = max_position_embeddings
+        
         self.eps = 1e-6
         self.get_query_key = ColumnParallelLinear(
             hidden_size,
@@ -927,6 +760,7 @@ class YuanAttention(nn.Module):
         v, _ = self.v_proj(hidden_states)
         hidden_states, lf1, lf2 = self.lf_gate(hidden_states, lf1_cache, lf2_cache, attn_metadata)
         #v = v.view(*v.shape[:-1], self.num_heads, self.attn_head_size)
+        hidden_states = hidden_states.contiguous().view(-1, hidden_states.shape[-1])
         qk, _ = self.get_query_key(hidden_states)
         qk = qk.view(*qk.shape[:-1], self.num_heads, int(qk.shape[-1] // self.num_heads))
         (q, k) = torch.chunk(qk, 2, dim=-1)
@@ -994,17 +828,8 @@ class YuanDecoderLayer(nn.Module):
         attn_factor: float=1.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        #if hidden_states.shape == torch.Size([6, 2048]):
-        #    print("mlp:", self.mlp(hidden_states, attn_metadata))
-        #    import pdb;pdb.set_trace()
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        #if hidden_states.shape == torch.Size([6, 2048]):
-        #    print(hidden_states)
-        #if hidden_states.shape == torch.Size([6, 2048]):
-        #    hidden_states = residual + hidden_states
-        #    hidden_states = self.post_attention_layernorm(hidden_states)
-        #    hidden_states = self.mlp(hidden_states, attn_metadata)
         hidden_states, lf1, lf2 = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -1090,8 +915,6 @@ class YuanModel(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-        #if hidden_states.shape == torch.Size([6, 2048]):
-        #    import pdb;pdb.set_trace()
         rotary_pos_emb = self.rotary_emb(hidden_states, self.seq_len)
         
         global global_seq_list
@@ -1246,8 +1069,7 @@ class YuanForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
-        qk = {}
-
+        qk_projs = {}
         if self.use_moe:
             moe_state_dict = {}
         for name, loaded_weight in weights:
@@ -1258,9 +1080,7 @@ class YuanForCausalLM(nn.Module):
                     moe_state_dict[name] = loaded_weight
                     continue
             if "get_query_key" in name:
-                #print(name)
-                #name = name.replace('get_query_key', 'get_query_key.weight')
-                qk[name] = loaded_weight.permute(1, 0)
+                qk_projs[name] = loaded_weight
                 continue
             param = params_dict[name]
             if name.endswith(".bias") and name not in params_dict:
@@ -1269,60 +1089,58 @@ class YuanForCausalLM(nn.Module):
                                     default_weight_loader)
             weight_loader(param, loaded_weight)
             tp_rank = get_tensor_model_parallel_rank()
-        
-        for i in range(self.config.num_hidden_layers):
-            hf_name = f'model.layers.{i}.self_attn.get_query_key'
-            qk_weight = qk[hf_name]
-            #print("qk_weight:", qk_weight.shape)
-            name = f'model.layers.{i}.self_attn.get_query_key.weight'
+        # load get_query_key weights
+        for layer_id in range(self.config.num_hidden_layers):
+            hf_name1 = f'model.layers.{layer_id}.self_attn.get_query_key.weight'
+            hf_name2 = f'model.layers.{layer_id}.self_attn.get_query_key'
+            name = f'model.layers.{layer_id}.self_attn.get_query_key.weight'
             param = params_dict[name]
-            #print("params_dict", params_dict[name].shape)
-            weight_loader = getattr(param, "weight_loader",
-                                    default_weight_loader)
-            weight_loader(param, qk_weight)
+            weight_loader = getattr(param, 'weight_loader', default_weight_loader)
+            if hf_name1 in qk_projs:
+                weight_loader(param, qk_projs[hf_name1])
+            else:
+                weight_loader(param, qk_projs[hf_name2].permute(1,0))
         if self.use_moe:
             for layer_id in range(self.config.num_hidden_layers):
-                hf_name = f'model.layers.{layer_id}.mlp.gate.query_key_value'
                 name = f'model.layers.{layer_id}.mlp.gate.query_key_value.weight'
+                hf_name1 = f'model.layers.{layer_id}.mlp.gate.query_key_value.weight'
+                hf_name2 = f'model.layers.{layer_id}.mlp.gate.query_key_value'
                 param = params_dict[name]
-                #print("loaded:", moe_state_dict[hf_name].shape, "param:", param.shape)
                 weight_loader = getattr(param, 'weight_loader', default_weight_loader)
-                weight_loader(param, moe_state_dict[hf_name].permute(1, 0))
-                '''
+                if hf_name1 in  moe_state_dict:
+                    weight_loader(param, moe_state_dict[hf_name1])
+                else:
+                    weight_loader(param, moe_state_dict[hf_name2].permute(1, 0))
+
                 experts = []
-                for expert_id in range(self.config.moe_config['moe_num_experts']):
-                    hf_name = f'model.layers.{layer_id}.mlp.experts.w1.{expert_id}.weight'
-                    experts.append(moe_state_dict[hf_name].T.unsqueeze(0))#.view(1, *moe_state_dict[hf_name].shape)
-                experts_weight = torch.cat(experts, dim=0)
-                #name = f'model.layers.{layer_id}.mlp.w1'
                 name = f'model.layers.{layer_id}.mlp.experts.w1'
-                param = params_dict[name]
-                weight_loader = getattr(param, 'weight_loader', default_weight_loader)
-                weight_loader(param, experts_weight, name)
+                hf_name1 = f'model.layers.{layer_id}.mlp.experts.weight1'
+                if hf_name1 in  moe_state_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, 'weight_loader', default_weight_loader)
+                    weight_loader(param, moe_state_dict[hf_name1], name)
+                else:
+                    for expert_id in range(self.config.moe_config['moe_num_experts']):
+                        hf_name2 = f'model.layers.{layer_id}.mlp.experts.w1.{expert_id}.weight'
+                        experts.append(moe_state_dict[hf_name2].T.unsqueeze(0))#.view(1, *moe_state_dict[hf_name].shape)
+                    experts_weight = torch.cat(experts, dim=0)
+                    param = params_dict[name]
+                    weight_loader = getattr(param, 'weight_loader', default_weight_loader)
+                    weight_loader(param, experts_weight, name)
 
                 experts = []
-                for expert_id in range(self.config.moe_config['moe_num_experts']):
-                    hf_name = f'model.layers.{layer_id}.mlp.experts.w2.{expert_id}.weight'
-                    experts.append(moe_state_dict[hf_name].T.unsqueeze(0))#.view(1, *moe_state_dict[hf_name].shape)
-                experts_weight = torch.cat(experts, dim=0)
-                #name = f'model.layers.{layer_id}.mlp.w2'
                 name = f'model.layers.{layer_id}.mlp.experts.w2'
-                param = params_dict[name]
-                weight_loader = getattr(param, 'weight_loader', default_weight_loader)
-                weight_loader(param, experts_weight, name)
-                '''
-                for expert_id in range(self.config.moe_config['moe_num_experts']):
-                    #name = f'model.layers.{layer_id}.mlp.experts.w1.{expert_id}.weight'
-                    hf_name_w1 = f'model.layers.{layer_id}.mlp.experts.weight1'
-                    name_w1 = f'model.layers.{layer_id}.mlp.experts.w1'
-                    param = params_dict[name_w1]
+                hf_name1 = f'model.layers.{layer_id}.mlp.experts.weight2'
+                if hf_name1 in  moe_state_dict:
+                    param = params_dict[name]
                     weight_loader = getattr(param, 'weight_loader', default_weight_loader)
-                    weight_loader(param, moe_state_dict[hf_name_w1], name_w1)
-
-                    #name = f'model.layers.{layer_id}.mlp.experts.w2.{expert_id}.weight'
-                    hf_name_w2 = f'model.layers.{layer_id}.mlp.experts.weight2'
-                    name_w2 = f'model.layers.{layer_id}.mlp.experts.w2'
-                    param = params_dict[name_w2]
+                    weight_loader(param, moe_state_dict[hf_name1], name)
+                else:
+                    for expert_id in range(self.config.moe_config['moe_num_experts']):
+                        hf_name2 = f'model.layers.{layer_id}.mlp.experts.w2.{expert_id}.weight'
+                        experts.append(moe_state_dict[hf_name2].T.unsqueeze(0))#.view(1, *moe_state_dict[hf_name].shape)
+                    experts_weight = torch.cat(experts, dim=0)
+                    param = params_dict[name]
                     weight_loader = getattr(param, 'weight_loader', default_weight_loader)
-                    weight_loader(param, moe_state_dict[hf_name_w2], name_w2)
-
+                    weight_loader(param, experts_weight, name)
+                 
